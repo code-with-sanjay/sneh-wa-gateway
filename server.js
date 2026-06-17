@@ -1,6 +1,6 @@
 // ============================================================
-//  Sneh WA-Gateway – Production Server (MongoDB Sessions)
-//  Fixed: no duplicate variable declarations
+//  Sneh WA-Gateway – Production Server
+//  Custom MongoDB Auth State (No external helper)
 // ============================================================
 
 const express = require('express');
@@ -10,7 +10,6 @@ const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const { 
   makeWASocket, 
-  useMongoAuthState,
   useMultiFileAuthState,
   DisconnectReason
 } = require('@whiskeysockets/baileys');
@@ -74,6 +73,47 @@ async function connectToDatabase() {
   }
 }
 
+// ============================================================
+//  CUSTOM MONGODB AUTH STATE (Replaces useMongoAuthState)
+// ============================================================
+async function getMongoAuthState(userId) {
+  if (!sessionsCollection) {
+    // Fallback to file-based if MongoDB is not available
+    const userSessionDir = path.join(SESSION_DIR, userId);
+    if (!fs.existsSync(userSessionDir)) {
+      fs.mkdirSync(userSessionDir, { recursive: true });
+    }
+    const { state, saveCreds } = await useMultiFileAuthState(userSessionDir);
+    return { state, saveCreds };
+  }
+
+  // Try to load existing creds from MongoDB
+  const doc = await sessionsCollection.findOne({ userId });
+  const creds = doc?.creds || {};
+
+  // Create a state object with the creds
+  const state = {
+    creds: creds,
+    // keys are not needed for Baileys v6
+  };
+
+  // Save function – updates the MongoDB document
+  const saveCreds = async () => {
+    if (!sessionsCollection) return;
+    try {
+      await sessionsCollection.updateOne(
+        { userId },
+        { $set: { userId, creds: state.creds } },
+        { upsert: true }
+      );
+    } catch (err) {
+      console.error(`[DB] Failed to save creds for ${userId}:`, err);
+    }
+  };
+
+  return { state, saveCreds };
+}
+
 // ===== SESSION MANAGEMENT =====
 const activeSockets = {};
 const pendingQRs = {};
@@ -81,28 +121,13 @@ const reconnectAttempts = {};
 
 // ===== CONNECTION FUNCTION =====
 async function connectToWhatsApp(userId, res = null) {
-  // Ensure database is connected (if URI provided)
-  let collection = sessionsCollection;
-  if (MONGODB_URI && !collection) {
-    collection = await connectToDatabase();
+  // Ensure database is connected
+  if (MONGODB_URI && !sessionsCollection) {
+    await connectToDatabase();
   }
 
-  let authState;
-  if (collection) {
-    // Use MongoDB – sessions persist across restarts
-    const { state, saveCreds } = await useMongoAuthState(collection, userId);
-    authState = { state, saveCreds };
-  } else {
-    // Fallback to file-based (ephemeral) – sessions lost on restart
-    const userSessionDir = path.join(SESSION_DIR, userId);
-    if (!fs.existsSync(userSessionDir)) {
-      fs.mkdirSync(userSessionDir, { recursive: true });
-    }
-    const { state, saveCreds } = await useMultiFileAuthState(userSessionDir);
-    authState = { state, saveCreds };
-  }
-
-  const { state, saveCreds } = authState;  // ← single declaration
+  // Get auth state (MongoDB or file fallback)
+  const { state, saveCreds } = await getMongoAuthState(userId);
 
   const sock = makeWASocket({
     auth: state,
@@ -118,13 +143,8 @@ async function connectToWhatsApp(userId, res = null) {
   activeSockets[userId] = sock;
   reconnectAttempts[userId] = 0;
 
-  sock.ev.on('creds.update', async () => {
-    if (collection) {
-      // MongoDB saves automatically via useMongoAuthState
-    } else {
-      await saveCreds();
-    }
-  });
+  // Save credentials whenever they change
+  sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -232,6 +252,10 @@ app.post('/api/wa/disconnect', (req, res) => {
     delete activeSockets[sanitizedUserId];
     delete pendingQRs[sanitizedUserId];
     delete reconnectAttempts[sanitizedUserId];
+    // Optionally delete session from MongoDB
+    if (sessionsCollection) {
+      sessionsCollection.deleteOne({ userId: sanitizedUserId }).catch(console.error);
+    }
   }
 
   res.json({ success: true });
@@ -332,7 +356,7 @@ app.get('/api/health', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'Sneh WA-Gateway',
-    version: '2.1.1',
+    version: '2.1.2',
     status: 'running',
     endpoints: {
       qr: 'GET /api/wa/qr?userId=xxx',
@@ -361,10 +385,10 @@ async function startServer() {
 
   app.listen(PORT, () => {
     console.log(`========================================`);
-    console.log(`🚀 Sneh WA-Gateway v2.1.1`);
+    console.log(`🚀 Sneh WA-Gateway v2.1.2`);
     console.log(`📍 Running on port: ${PORT}`);
     console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`📁 Session storage: ${MONGODB_URI ? 'MongoDB' : 'File (ephemeral)'}`);
+    console.log(`📁 Session storage: ${MONGODB_URI ? 'MongoDB (custom)' : 'File (ephemeral)'}`);
     console.log(`🔗 CORS allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
     console.log(`========================================`);
   });
