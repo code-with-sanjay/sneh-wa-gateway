@@ -1,6 +1,6 @@
 // ============================================================
 //  Sneh WA-Gateway – Production Server
-//  Custom MongoDB Auth State (No external helper)
+//  Custom MongoDB KeyStore (Full KeyStore interface)
 // ============================================================
 
 const express = require('express');
@@ -50,6 +50,7 @@ app.use('/api/', limiter);
 // ===== DATABASE CONNECTION =====
 let dbClient = null;
 let sessionsCollection = null;
+let keysCollection = null;
 
 async function connectToDatabase() {
   if (!MONGODB_URI) {
@@ -64,7 +65,9 @@ async function connectToDatabase() {
     await dbClient.connect();
     const db = dbClient.db('sneh');
     sessionsCollection = db.collection('sessions');
+    keysCollection = db.collection('keys');
     await sessionsCollection.createIndex({ userId: 1 }, { unique: true });
+    await keysCollection.createIndex({ userId: 1, type: 1, ids: 1 });
     console.log('[DB] Connected to MongoDB.');
     return sessionsCollection;
   } catch (err) {
@@ -74,11 +77,63 @@ async function connectToDatabase() {
 }
 
 // ============================================================
-//  CUSTOM MONGODB AUTH STATE (Replaces useMongoAuthState)
+//  CUSTOM KEYSTORE (Backed by MongoDB)
+//  Implements the full Baileys KeyStore interface
+// ============================================================
+class MongoKeyStore {
+  constructor(userId) {
+    this.userId = userId;
+  }
+
+  async get(type, ids) {
+    if (!keysCollection) return [];
+    try {
+      const docs = await keysCollection.find({ userId: this.userId, type, ids: { $in: ids } }).toArray();
+      return docs.map(doc => ({ ...doc.data }));
+    } catch {
+      return [];
+    }
+  }
+
+  async set(data) {
+    if (!keysCollection) return;
+    for (const item of data) {
+      const { id, type, value } = item;
+      await keysCollection.updateOne(
+        { userId: this.userId, type, id },
+        { $set: { userId: this.userId, type, id, data: value } },
+        { upsert: true }
+      );
+    }
+  }
+
+  async getOrCreate(type, ids) {
+    if (!keysCollection) return [];
+    const existing = await this.get(type, ids);
+    if (existing.length > 0) return existing;
+    // Create new keys (Baileys will populate them)
+    const newKeys = ids.map(id => ({ id, type, value: null }));
+    await this.set(newKeys);
+    return newKeys;
+  }
+
+  async delete(type, ids) {
+    if (!keysCollection) return;
+    await keysCollection.deleteMany({ userId: this.userId, type, id: { $in: ids } });
+  }
+
+  async clear() {
+    if (!keysCollection) return;
+    await keysCollection.deleteMany({ userId: this.userId });
+  }
+}
+
+// ============================================================
+//  CUSTOM AUTH STATE (Creds + KeyStore)
 // ============================================================
 async function getMongoAuthState(userId) {
+  // If MongoDB is not available, fallback to file
   if (!sessionsCollection) {
-    // Fallback to file-based if MongoDB is not available
     const userSessionDir = path.join(SESSION_DIR, userId);
     if (!fs.existsSync(userSessionDir)) {
       fs.mkdirSync(userSessionDir, { recursive: true });
@@ -87,19 +142,17 @@ async function getMongoAuthState(userId) {
     return { state, saveCreds };
   }
 
-  // Try to load existing creds from MongoDB
+  // Load credentials from MongoDB
   const doc = await sessionsCollection.findOne({ userId });
   const creds = doc?.creds || {};
 
-  // Create a state object with the creds
+  // Create state with creds and the custom key store
   const state = {
-    creds: creds,
-    // keys are not needed for Baileys v6
+    creds,
+    keys: new MongoKeyStore(userId)
   };
 
-  // Save function – updates the MongoDB document
   const saveCreds = async () => {
-    if (!sessionsCollection) return;
     try {
       await sessionsCollection.updateOne(
         { userId },
@@ -121,12 +174,10 @@ const reconnectAttempts = {};
 
 // ===== CONNECTION FUNCTION =====
 async function connectToWhatsApp(userId, res = null) {
-  // Ensure database is connected
   if (MONGODB_URI && !sessionsCollection) {
     await connectToDatabase();
   }
 
-  // Get auth state (MongoDB or file fallback)
   const { state, saveCreds } = await getMongoAuthState(userId);
 
   const sock = makeWASocket({
@@ -143,7 +194,6 @@ async function connectToWhatsApp(userId, res = null) {
   activeSockets[userId] = sock;
   reconnectAttempts[userId] = 0;
 
-  // Save credentials whenever they change
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
@@ -196,8 +246,7 @@ async function connectToWhatsApp(userId, res = null) {
   return sock;
 }
 
-// ===== API ENDPOINTS =====
-
+// ===== API ENDPOINTS (unchanged) =====
 app.get('/api/wa/qr', async (req, res) => {
   const { userId } = req.query;
   if (!userId) return res.status(400).json({ error: 'Missing userId' });
@@ -252,7 +301,10 @@ app.post('/api/wa/disconnect', (req, res) => {
     delete activeSockets[sanitizedUserId];
     delete pendingQRs[sanitizedUserId];
     delete reconnectAttempts[sanitizedUserId];
-    // Optionally delete session from MongoDB
+    // Clean up keys and creds from MongoDB
+    if (keysCollection) {
+      keysCollection.deleteMany({ userId: sanitizedUserId }).catch(console.error);
+    }
     if (sessionsCollection) {
       sessionsCollection.deleteOne({ userId: sanitizedUserId }).catch(console.error);
     }
@@ -356,7 +408,7 @@ app.get('/api/health', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'Sneh WA-Gateway',
-    version: '2.1.2',
+    version: '2.2.0',
     status: 'running',
     endpoints: {
       qr: 'GET /api/wa/qr?userId=xxx',
@@ -385,10 +437,10 @@ async function startServer() {
 
   app.listen(PORT, () => {
     console.log(`========================================`);
-    console.log(`🚀 Sneh WA-Gateway v2.1.2`);
+    console.log(`🚀 Sneh WA-Gateway v2.2.0`);
     console.log(`📍 Running on port: ${PORT}`);
     console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`📁 Session storage: ${MONGODB_URI ? 'MongoDB (custom)' : 'File (ephemeral)'}`);
+    console.log(`📁 Session storage: ${MONGODB_URI ? 'MongoDB (with custom KeyStore)' : 'File (ephemeral)'}`);
     console.log(`🔗 CORS allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
     console.log(`========================================`);
   });
