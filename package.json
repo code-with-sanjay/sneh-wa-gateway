@@ -1,6 +1,6 @@
 {
   "name": "sneh-wa-gateway",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Production WhatsApp Gateway for Sneh AI - Multi-user, Always-on",
   "main": "server.js",
   "scripts": {
@@ -18,7 +18,8 @@
     "express-rate-limit": "^7.1.5",
     "qrcode": "^1.5.3",
     "helmet": "^7.1.0",
-    "compression": "^1.7.4"
+    "compression": "^1.7.4",
+    "mongodb": "^6.3.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
