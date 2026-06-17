@@ -20,7 +20,7 @@ const path = require('path');
 // ===== CONFIGURATION =====
 const PORT = process.env.PORT || 5000;
 const SESSION_DIR = process.env.SESSION_DIR || './sessions';
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:8080,https://your-domain.com').split(',');
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:8080,https://snehai.netlify.app').split(',');
 
 // ===== SETUP =====
 const app = express();
