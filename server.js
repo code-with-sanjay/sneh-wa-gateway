@@ -1,6 +1,6 @@
 // ============================================================
 //  Sneh WA-Gateway – Production Server (MongoDB Sessions)
-//  Improved reconnection logic & persistent storage
+//  Fixed: no duplicate variable declarations
 // ============================================================
 
 const express = require('express');
@@ -10,7 +10,8 @@ const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const { 
   makeWASocket, 
-  useMongoAuthState,       // <-- Use MongoDB for sessions
+  useMongoAuthState,
+  useMultiFileAuthState,
   DisconnectReason
 } = require('@whiskeysockets/baileys');
 const { MongoClient } = require('mongodb');
@@ -22,12 +23,7 @@ const path = require('path');
 const PORT = process.env.PORT || 5000;
 const SESSION_DIR = process.env.SESSION_DIR || './sessions';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:8080,https://snehai.netlify.app').split(',');
-
-// MongoDB URI – must be set in environment
 const MONGODB_URI = process.env.MONGODB_URI;
-if (!MONGODB_URI) {
-  console.warn('⚠️ MONGODB_URI not set. Sessions will NOT persist across restarts!');
-}
 
 // ===== SETUP =====
 const app = express();
@@ -58,7 +54,7 @@ let sessionsCollection = null;
 
 async function connectToDatabase() {
   if (!MONGODB_URI) {
-    console.warn('[DB] MongoDB not configured – session persistence disabled.');
+    console.warn('[DB] MongoDB not configured – sessions will be ephemeral (file‑based).');
     return null;
   }
   try {
@@ -69,7 +65,6 @@ async function connectToDatabase() {
     await dbClient.connect();
     const db = dbClient.db('sneh');
     sessionsCollection = db.collection('sessions');
-    // Ensure unique index on userId
     await sessionsCollection.createIndex({ userId: 1 }, { unique: true });
     console.log('[DB] Connected to MongoDB.');
     return sessionsCollection;
@@ -82,13 +77,13 @@ async function connectToDatabase() {
 // ===== SESSION MANAGEMENT =====
 const activeSockets = {};
 const pendingQRs = {};
-const reconnectAttempts = {};  // per-user attempt counter
+const reconnectAttempts = {};
 
-// ===== CONNECTION FUNCTION (with MongoDB auth) =====
+// ===== CONNECTION FUNCTION =====
 async function connectToWhatsApp(userId, res = null) {
-  // Ensure database is ready
+  // Ensure database is connected (if URI provided)
   let collection = sessionsCollection;
-  if (!collection && MONGODB_URI) {
+  if (MONGODB_URI && !collection) {
     collection = await connectToDatabase();
   }
 
@@ -98,19 +93,16 @@ async function connectToWhatsApp(userId, res = null) {
     const { state, saveCreds } = await useMongoAuthState(collection, userId);
     authState = { state, saveCreds };
   } else {
-    // Fallback to file-based (ephemeral)
+    // Fallback to file-based (ephemeral) – sessions lost on restart
     const userSessionDir = path.join(SESSION_DIR, userId);
     if (!fs.existsSync(userSessionDir)) {
       fs.mkdirSync(userSessionDir, { recursive: true });
     }
-    const { state, saveCreds } = await useMongoAuthState?.(null, null); // Not supported – we'll handle separately
-    // Actually, we need to use useMultiFileAuthState as fallback
-    const { useMultiFileAuthState } = require('@whiskeysockets/baileys');
     const { state, saveCreds } = await useMultiFileAuthState(userSessionDir);
     authState = { state, saveCreds };
   }
 
-  const { state, saveCreds } = authState;
+  const { state, saveCreds } = authState;  // ← single declaration
 
   const sock = makeWASocket({
     auth: state,
@@ -124,7 +116,6 @@ async function connectToWhatsApp(userId, res = null) {
   });
 
   activeSockets[userId] = sock;
-  // Reset reconnect attempts on new connection attempt
   reconnectAttempts[userId] = 0;
 
   sock.ev.on('creds.update', async () => {
@@ -156,7 +147,6 @@ async function connectToWhatsApp(userId, res = null) {
 
     if (connection === 'open') {
       delete pendingQRs[userId];
-      // Reset reconnect attempts on successful connection
       reconnectAttempts[userId] = 0;
       console.log(`[WA] ✅ User ${userId} connected.`);
     }
@@ -166,10 +156,9 @@ async function connectToWhatsApp(userId, res = null) {
       delete pendingQRs[userId];
 
       if (shouldReconnect) {
-        // Exponential backoff – delay increases with each attempt
         const attempts = (reconnectAttempts[userId] || 0) + 1;
         reconnectAttempts[userId] = attempts;
-        const delay = Math.min(60000, 5000 + attempts * 3000); // max 60s
+        const delay = Math.min(60000, 5000 + attempts * 3000);
         console.log(`[WA] 🔄 Reconnecting for user ${userId} (attempt ${attempts}) in ${delay/1000}s...`);
         setTimeout(() => {
           connectToWhatsApp(userId).catch(err => {
@@ -177,7 +166,6 @@ async function connectToWhatsApp(userId, res = null) {
           });
         }, delay);
       } else {
-        // User logged out manually – clean up
         delete activeSockets[userId];
         delete reconnectAttempts[userId];
         console.log(`[WA] User ${userId} logged out permanently.`);
@@ -226,7 +214,7 @@ app.get('/api/wa/status', (req, res) => {
 
   res.json({
     connected: isConnected,
-    lastSeen: null // optional: store lastSeen in DB if needed
+    lastSeen: null
   });
 });
 
@@ -344,7 +332,7 @@ app.get('/api/health', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'Sneh WA-Gateway',
-    version: '2.1.0',
+    version: '2.1.1',
     status: 'running',
     endpoints: {
       qr: 'GET /api/wa/qr?userId=xxx',
@@ -367,14 +355,13 @@ app.use((err, req, res, next) => {
 
 // ===== START SERVER =====
 async function startServer() {
-  // Connect to MongoDB if URI is provided
   if (MONGODB_URI) {
     await connectToDatabase();
   }
 
   app.listen(PORT, () => {
     console.log(`========================================`);
-    console.log(`🚀 Sneh WA-Gateway v2.1.0`);
+    console.log(`🚀 Sneh WA-Gateway v2.1.1`);
     console.log(`📍 Running on port: ${PORT}`);
     console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
     console.log(`📁 Session storage: ${MONGODB_URI ? 'MongoDB' : 'File (ephemeral)'}`);
