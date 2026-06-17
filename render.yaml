@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: sneh-wa-gateway
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
+      - key: ALLOWED_ORIGINS
+        value: http://localhost:8080,https://snehai.netlify.app
+    healthCheckPath: /api/health
+    autoDeploy: true
